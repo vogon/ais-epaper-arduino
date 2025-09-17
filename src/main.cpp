@@ -3,6 +3,7 @@
 #include "lvgl.h"
 #include <WiFi.h>
 #include <ArduinoHttpClient.h>
+#include <protothreads.h>
 #include "secrets.hpp"
 
 // e-paper breakout pinout:
@@ -18,8 +19,9 @@ ThinkInk_213_Mono_GDEY0213B74 epd(11 /* D/C */, 8 /* RST */, 13 /* CS */,
 #define VER_RES 122
 #define ROTATION LV_DISPLAY_ROTATION_0
 
-/*LVGL draw into this buffer, 1/10 screen size usually works well. The size is in bytes*/
-#define DRAW_BUF_SIZE (HOR_RES * VER_RES / 5 * (LV_COLOR_DEPTH))
+// make sure the drawing buffer is large enough that lvgl can draw the entire
+// screen at once, to avoid multiple repaints per update
+#define DRAW_BUF_SIZE ((HOR_RES * VER_RES * LV_COLOR_DEPTH) + 16)
 
 uint32_t draw_buf[DRAW_BUF_SIZE / 4];
 
@@ -40,24 +42,40 @@ void my_disp_flush(lv_display_t *disp, const lv_area_t *area, unsigned char *px_
   lv_display_flush_ready(disp);
 }
 
+int last_response_code = 200;
+String last_message("starting up...");
+
+float vin_v = 0.0f;
+float vbat_v = 0.0f;
+
+static pt lvgl_task_pt;
+static pt update_screen_task_pt;
+static pt wifi_keep_alive_task_pt;
+static pt fetch_message_task_pt;
+static pt adc_update_task_pt;
+
+lv_display_t *disp;
+
 lv_obj_t *msg_label;
 lv_obj_t *wifi_label;
 lv_obj_t *v_label;
-int last_wifi_status = WL_IDLE_STATUS;
 
-const int ADC_BITS = 12;
-const int ADC_COUNTS_FULLSCALE = 1 << ADC_BITS;
+WiFiClient wifi;
+HttpClient http(wifi, SERVER_ADDRESS, SERVER_PORT);
 
-void setup() {
-  // digitalWrite(LED_BUILTIN, 1);
-  Serial.begin();
-  // while (!Serial) {
-  //   digitalWrite(LED_BUILTIN, (millis() >> 8) & 0x1);
-  // }
-  // digitalWrite(LED_BUILTIN, 0);
-  Serial.println("booted");
+static int lvgl_task(pt *pt) {
+  PT_BEGIN(pt);
 
-  analogReadResolution(ADC_BITS); // analogRead defaults to 10-bit ADC resolution; bump it up
+  while (true) {
+    lv_timer_handler();
+    PT_SLEEP(pt, 5);
+  }
+
+  PT_END(pt);
+}
+
+static int update_screen_task(pt *pt) {
+  PT_BEGIN(pt);
 
   epd.begin(THINKINK_MONO);
 
@@ -66,10 +84,13 @@ void setup() {
   lv_init();
   lv_tick_set_cb(my_tick);
 
-  lv_display_t *disp;
   disp = lv_display_create(HOR_RES, VER_RES);
+  // disable automatic refresh because this is e-paper and LVGL will
+  // automatically refresh after each element on the screen changes, which
+  // is obnoxious
+  lv_display_delete_refr_timer(disp);
   lv_display_set_flush_cb(disp, my_disp_flush);
-  lv_display_set_buffers(disp, draw_buf, NULL, sizeof(draw_buf), LV_DISPLAY_RENDER_MODE_PARTIAL);
+  lv_display_set_buffers(disp, draw_buf, NULL, sizeof(draw_buf), LV_DISPLAY_RENDER_MODE_FULL);
 
   Serial.println("past lvgl init");
 
@@ -102,32 +123,12 @@ void setup() {
   epd.display();
 
   Serial.println("past epd present");
-}
 
-WiFiClient wifi;
-HttpClient http(wifi, SERVER_ADDRESS, SERVER_PORT);
+  while (true) {
+    Serial.println("update_screen_task loop");
 
-const float VREF = 3.3f;
-
-const float ADC1_DIV_LO = 680.f;
-const float ADC1_DIV_HI = 1000.f;
-const float ADC2_DIV_LO = 1000.f;
-const float ADC2_DIV_HI = 1000.f;
-
-const float ADC1_MULT = (ADC1_DIV_HI + ADC1_DIV_LO) / ADC1_DIV_LO;
-const float ADC2_MULT = (ADC2_DIV_HI + ADC2_DIV_LO) / ADC2_DIV_LO;
-
-int loop_count = 0;
-int adc1_count_accum = 0;
-int adc2_count_accum = 0;
-
-void loop() {
-  int wifi_status = WiFi.status();
-
-  // update wifi status, if it's changed (set_text always dirties the screen, so
-  // don't thrash the e-paper if it hasn't)
-  if (wifi_status != last_wifi_status) {
-    switch (wifi_status) {
+    // update wifi status
+    switch (WiFi.status()) {
       case WL_CONNECTED:
         lv_label_set_text(wifi_label, LV_SYMBOL_WIFI LV_SYMBOL_OK);
         break;
@@ -136,52 +137,119 @@ void loop() {
         break;
     }
 
-    last_wifi_status = wifi_status;
+    // update voltage display
+    int vin_v_units = (int)vin_v;
+    int vin_v_100ths = (int)(vin_v * 100.f) % 100;
+    int vbat_v_units = (int)vbat_v;
+    int vbat_v_100ths = (int)(vbat_v * 100.f) % 100;
+
+    lv_label_set_text_fmt(v_label, "vin %d.%02d bat %d.%02d", vin_v_units, vin_v_100ths, 
+      vbat_v_units, vbat_v_100ths);
+
+    // update message
+    if (last_response_code >= 300) {
+      lv_label_set_text_fmt(msg_label, "error: API returned status code %d", last_response_code);
+    } else {
+      lv_label_set_text(msg_label, last_message.c_str());
+    }
+
+    lv_display_refr_timer(NULL);
+    PT_SLEEP(pt, 30000);
   }
 
-  if (wifi_status == WL_CONNECTED) {
-    // hit API every ~30 seconds
-    if (loop_count % 6144 == 0) {
+  PT_END(pt);
+}
+
+static int wifi_keep_alive_task(pt *pt) {
+  PT_BEGIN(pt);
+
+  while (true) {
+    Serial.println("wifi_keep_alive_task loop");
+
+    if (WiFi.status() != WL_CONNECTED) {
+      // if we're not connected to wifi, try to reconnect to wifi
+      WiFi.begin(WIFI_SSID, WIFI_PSK);
+    }
+
+    PT_SLEEP(pt, 1000);
+  }
+
+  PT_END(pt);
+}
+
+static int fetch_message_task(pt *pt) {
+  PT_BEGIN(pt);
+
+  while (true) {
+    Serial.println("fetch_message_task loop");
+
+    if (WiFi.status() == WL_CONNECTED) {
       http.get("/message");
 
-      int status_code = http.responseStatusCode();
-
-      if (status_code >= 300) {
-        lv_label_set_text_fmt(msg_label, "error: API returned status code %d", status_code);
-      } else {
-        lv_label_set_text(msg_label, http.responseBody().c_str());
-      }
+      last_response_code = http.responseStatusCode();
+      last_message = http.responseBody();
     }
-  } else {
-    // if we're not connected to wifi, try to reconnect to wifi
-    WiFi.begin(WIFI_SSID, WIFI_PSK);
+
+    PT_SLEEP(pt, 30000);
   }
 
-  // check vin + vbat every ~5 seconds -- oversample a bit to smooth out noise
-  if (loop_count % 1024 == 0) {
-    adc1_count_accum += analogRead(27);
-    adc2_count_accum += analogRead(28);
+  PT_END(pt);
+}
+  
+const int ADC_BITS = 12;
+const int ADC_COUNTS_FULLSCALE = 1 << ADC_BITS;
+
+static int adc_update_task(pt *pt) {
+  PT_BEGIN(pt);
+
+  const float VREF = 3.3f;
+
+  const float ADC1_DIV_LO = 680.f;
+  const float ADC1_DIV_HI = 1000.f;
+  const float ADC2_DIV_LO = 1000.f;
+  const float ADC2_DIV_HI = 1000.f;
+
+  const float ADC1_MULT = (ADC1_DIV_HI + ADC1_DIV_LO) / ADC1_DIV_LO;
+  const float ADC2_MULT = (ADC2_DIV_HI + ADC2_DIV_LO) / ADC2_DIV_LO;
+
+  while (true) {
+    Serial.println("adc_update_task loop");
+
+    int vin_counts = analogRead(27);
+    int vbat_counts = analogRead(28);
+
+    // convert the counts to a voltage
+    vin_v = VREF * ADC1_MULT * vin_counts / ADC_COUNTS_FULLSCALE;
+    vbat_v = VREF * ADC2_MULT * vbat_counts / ADC_COUNTS_FULLSCALE;
+
+    PT_SLEEP(pt, 5000);
   }
 
-  // update voltage display every ~20 seconds
-  if (loop_count % 4096 == 0) {
-    // divide out the oversampling; convert the averaged count back to a voltage
-    float adc1_v = VREF * ADC1_MULT * (adc1_count_accum >> 2) / ADC_COUNTS_FULLSCALE;
-    float adc2_v = VREF * ADC2_MULT * (adc2_count_accum >> 2) / ADC_COUNTS_FULLSCALE;
+  PT_END(pt);
+}
 
-    int adc1_v_units = (int)adc1_v;
-    int adc1_v_100ths = (int)(adc1_v * 100.f) % 100;
-    int adc2_v_units = (int)adc2_v;
-    int adc2_v_100ths = (int)(adc2_v * 100.f) % 100;
+void setup() {
+  // digitalWrite(LED_BUILTIN, 1);
+  Serial.begin();
+  // while (!Serial) {
+  //   digitalWrite(LED_BUILTIN, (millis() >> 8) & 0x1);
+  // }
+  // digitalWrite(LED_BUILTIN, 0);
+  Serial.println("booted");
 
-    lv_label_set_text_fmt(v_label, "vin %d.%02d bat %d.%02d", adc1_v_units, adc1_v_100ths, 
-      adc2_v_units, adc2_v_100ths);
+  analogReadResolution(ADC_BITS); // analogRead defaults to 10-bit ADC resolution; bump it up
 
-    adc1_count_accum = adc2_count_accum = 0;
-  }
+  PT_INIT(&lvgl_task_pt);
+  PT_INIT(&update_screen_task_pt);
+  PT_INIT(&wifi_keep_alive_task_pt);
+  PT_INIT(&fetch_message_task_pt);
+  PT_INIT(&adc_update_task_pt);
+}
 
-  lv_timer_handler();
-  delay(5);
-
-  loop_count++;
+void loop() {
+  lvgl_task(&lvgl_task_pt);
+  update_screen_task(&update_screen_task_pt);
+  wifi_keep_alive_task(&wifi_keep_alive_task_pt);
+  fetch_message_task(&fetch_message_task_pt);
+  adc_update_task(&adc_update_task_pt);
 }
