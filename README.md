@@ -50,6 +50,7 @@ maximum power voltage of 6.11 volts but an open circuit voltage of 7.25 volts,
 so out of an abundance of caution I divided it down with a 1M/680K divider to
 ~2.93 volts.  to reduce the amount the ADC loads the high impedance of the
 divider, I also put one 1uf capacitor between each divided voltage and ground.
-connect the divided voltages to GPIOs 32 (ADC1) and 34 (ADC2).
+connect the divided voltages to GPIOs 32 (ADC1) for the panel voltage and 34 (ADC2)
+for the battery voltage.
 
 [resistive-divider]: https://en.wikipedia.org/wiki/Voltage_divider#Resistive_divider
