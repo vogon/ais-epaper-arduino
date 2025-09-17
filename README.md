@@ -32,13 +32,15 @@ easier to work in tight spaces than traditional hook-up wire.)
 ## stuff to connect
 
 connect the "load" output of the BQ25185 breakout to the VSYS and GND pins of the
-Pico; the Pico bucks VSYS down to 3.3 and 1.8 volts, which will get along fine
-with the BQ25185's ~3.6-4.5 volt output.  connect the power input of the BQ25185
-breakout to your solar panel (some cheap 0.1" screw terminals are useful here.)
+Pico; the Pico bucks VSYS down to 3.3 and 1.8 volts and accepts up to 5.5, which
+will get along fine with the BQ25185's ~3.6-4.5 volt output.  connect the power
+input of the BQ25185 breakout to your solar panel (some cheap 0.1" screw
+terminals are useful here.)
 
 you'll need to connect the SCK, MISO, MOSI, and (E)CS pins of the e-paper breakout
 to one of the Pico's hardware SPI devices.  I used GPIO 14, 12, 15, and 13
-respectively, which correspond to SPI1.
+respectively, which correspond to SPI1.  you should also connect the RST, D/C, and
+BUSY pins to available GPIOs; I used GPIOs 8, 11, and 7 for those.
 
 in addition to however you connected the BQ25185 breakout to the main board,
 connect some fly wires to the VIN and VBAT pads on the side for voltage monitoring.
