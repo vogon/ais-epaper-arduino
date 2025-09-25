@@ -68,7 +68,7 @@ static int lvgl_task(pt *pt) {
 
   while (true) {
     lv_timer_handler();
-    PT_SLEEP(pt, 5);
+    PT_SLEEP(pt, 50);
   }
 
   PT_END(pt);
