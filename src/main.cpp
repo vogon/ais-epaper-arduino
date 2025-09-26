@@ -50,7 +50,6 @@ float vbat_v = 0.0f;
 
 static pt lvgl_task_pt;
 static pt update_screen_task_pt;
-static pt wifi_keep_alive_task_pt;
 static pt fetch_message_task_pt;
 static pt adc_update_task_pt;
 
@@ -60,8 +59,10 @@ lv_obj_t *msg_label;
 lv_obj_t *wifi_label;
 lv_obj_t *v_label;
 
-WiFiClient wifi;
-HttpClient http(wifi, SERVER_ADDRESS, SERVER_PORT);
+static WiFiClient wifi;
+static HttpClient http(wifi, SERVER_ADDRESS, SERVER_PORT);
+
+bool last_fetch_ok = false;
 
 static int lvgl_task(pt *pt) {
   PT_BEGIN(pt);
@@ -128,13 +129,10 @@ static int update_screen_task(pt *pt) {
     Serial.println("update_screen_task loop");
 
     // update wifi status
-    switch (WiFi.status()) {
-      case WL_CONNECTED:
-        lv_label_set_text(wifi_label, LV_SYMBOL_WIFI LV_SYMBOL_OK);
-        break;
-      default:
-        lv_label_set_text(wifi_label, LV_SYMBOL_WIFI LV_SYMBOL_REFRESH);
-        break;
+    if (last_fetch_ok) {
+      lv_label_set_text(wifi_label, LV_SYMBOL_WIFI LV_SYMBOL_OK);
+    } else {
+      lv_label_set_text(wifi_label, (String(LV_SYMBOL_WIFI LV_SYMBOL_REFRESH) + String(last_response_code)).c_str());
     }
 
     // update voltage display
@@ -147,31 +145,10 @@ static int update_screen_task(pt *pt) {
       vbat_v_units, vbat_v_100ths);
 
     // update message
-    if (last_response_code >= 300) {
-      lv_label_set_text_fmt(msg_label, "error: API returned status code %d", last_response_code);
-    } else {
-      lv_label_set_text(msg_label, last_message.c_str());
-    }
+    lv_label_set_text(msg_label, last_message.c_str());
 
     lv_display_refr_timer(NULL);
     PT_SLEEP(pt, 30000);
-  }
-
-  PT_END(pt);
-}
-
-static int wifi_keep_alive_task(pt *pt) {
-  PT_BEGIN(pt);
-
-  while (true) {
-    Serial.println("wifi_keep_alive_task loop");
-
-    if (WiFi.status() != WL_CONNECTED) {
-      // if we're not connected to wifi, try to reconnect to wifi
-      WiFi.begin(WIFI_SSID, WIFI_PSK);
-    }
-
-    PT_SLEEP(pt, 1000);
   }
 
   PT_END(pt);
@@ -183,14 +160,25 @@ static int fetch_message_task(pt *pt) {
   while (true) {
     Serial.println("fetch_message_task loop");
 
+    int connect_start = millis();
+    WiFi.beginNoBlock(WIFI_SSID, WIFI_PSK);
+
+    PT_YIELD_UNTIL(pt, WiFi.connected() || (millis() - connect_start) > 30000);
+
+    WiFi.aggressiveLowPowerMode();
+
     if (WiFi.status() == WL_CONNECTED) {
       http.get("/message");
 
-      last_response_code = http.responseStatusCode();
       last_message = http.responseBody();
+      last_fetch_ok = (http.responseStatusCode() < 300);
+    } else {
+      last_fetch_ok = false;
     }
 
-    PT_SLEEP(pt, 30000);
+    // WiFi.disconnect();
+
+    PT_SLEEP(pt, 60000);
   }
 
   PT_END(pt);
@@ -241,7 +229,6 @@ void setup() {
 
   PT_INIT(&lvgl_task_pt);
   PT_INIT(&update_screen_task_pt);
-  PT_INIT(&wifi_keep_alive_task_pt);
   PT_INIT(&fetch_message_task_pt);
   PT_INIT(&adc_update_task_pt);
 }
@@ -249,7 +236,6 @@ void setup() {
 void loop() {
   lvgl_task(&lvgl_task_pt);
   update_screen_task(&update_screen_task_pt);
-  wifi_keep_alive_task(&wifi_keep_alive_task_pt);
   fetch_message_task(&fetch_message_task_pt);
   adc_update_task(&adc_update_task_pt);
 }
